@@ -713,7 +713,7 @@ class NeuralBeamSimulationApp:
         fig.update_layout(
             title=dict(text="Anatomical Brain Surface with Scientific Labels & Circuits"),
             scene=dict(
-                xaxis=dict(visible=True),
+                xaxis=dict(visible=True, autorange="reversed"),
                 yaxis=dict(visible=True),
                 zaxis=dict(visible=True),
                 camera=dict(
