@@ -38,7 +38,7 @@ EDGES_PATH = "connectivity_edges.bin"
 # ---------------------------------------------------------------------------
 # 1. Load the real MRI scan
 # ---------------------------------------------------------------------------
-def load_real_mri_volume(path=MRI_PATH, downsample=8):
+def load_real_mri_volume(path=MRI_PATH, downsample=1):
     """
     Load a real NIfTI scan and normalize/downsample it so the rest of the
     pipeline (node count, disk edge list, beam search) stays fast.

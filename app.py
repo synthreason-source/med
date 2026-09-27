@@ -1,164 +1,413 @@
+import heapq
+import threading
+import queue
+import time
+import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from pathlib import Path
-import struct, mmap, time, threading, queue
+from tkinter import ttk, messagebox
 import numpy as np
 
-EDGE_DTYPE=np.dtype([('src','<u4'),('dst','<u4'),('weight','<f4')])
 try:
-    import cupy as cp
-    import cupyx.scipy.sparse as cpsp
-    GPU_AVAILABLE=True
-except Exception:
-    cp=None; cpsp=None; GPU_AVAILABLE=False
-try:
-    import scipy.sparse as sps
-except Exception:
-    sps=None
+    import nibabel as nib
+    from nilearn import plotting, datasets
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
 
-class ConnectivityLoader:
-    def __init__(self,edge_path,points_path): self.edge_path=Path(edge_path); self.points_path=Path(points_path)
-    def load_points(self):
-        a=np.load(self.points_path,mmap_mode='r')
-        if a.ndim!=2 or a.shape[1]<2: raise ValueError('points must be N x 2 or N x 3')
-        a=np.asarray(a[:,:3],dtype=np.float32)
-        if a.shape[1]==2: a=np.column_stack((a,np.zeros(len(a),np.float32)))
-        return np.ascontiguousarray(a)
-    def load_edges(self,n):
-        size=self.edge_path.stat().st_size
-        rec=EDGE_DTYPE.itemsize
-        usable=size-(size%rec)
-        if usable<=0:return np.empty(0,np.int32),np.empty(0,np.int32),np.empty(0,np.float32)
-        with self.edge_path.open('rb') as f, mmap.mmap(f.fileno(),usable,access=mmap.ACCESS_READ) as mm:
-            a=np.frombuffer(mm,dtype=EDGE_DTYPE,count=usable//rec).copy()  # .copy() breaks the mmap buffer export so mm.close() below doesn't raise BufferError
-            src=np.asarray(a['src'],np.uint32); dst=np.asarray(a['dst'],np.uint32); w=np.asarray(a['weight'],np.float32)
-            mask=(src<n)&(dst<n)&np.isfinite(w)&(w!=0)
-            return src[mask].astype(np.int32,copy=True),dst[mask].astype(np.int32,copy=True),w[mask].astype(np.float32,copy=True)
 
-class Network:
-    def __init__(self,p,e,gpu=True):
-        self.points=p; self.src,self.dst,self.weight=e; self.n=len(p); self.device='CPU'; self.xp=np
-        if gpu and GPU_AVAILABLE:
-            try:
-                rows=cp.asarray(self.dst); cols=cp.asarray(self.src); vals=cp.asarray(self.weight)
-                self.M=cpsp.csr_matrix((vals,(rows,cols)),shape=(self.n,self.n),dtype=cp.float32)
-                self.xp=cp; self.device='CUDA'; cp.cuda.Stream.null.synchronize()
-            except Exception as ex: print('CUDA:',ex); self._cpu()
-        else:self._cpu()
-        self.reset()
-    def _cpu(self):
-        if sps is None: raise RuntimeError('Install scipy or CuPy')
-        self.M=sps.csr_matrix((self.weight,(self.dst,self.src)),shape=(self.n,self.n),dtype=np.float32)
-        self.xp=np; self.device='CPU'
-    def reset(self):
-        x=self.xp; self.t=0; self.v=x.full(self.n,-65,dtype=x.float32); self.ref=x.zeros(self.n,dtype=x.int16); self.fired=np.empty(0,np.int32); self.step_ms=0
-        if self.device=='CUDA': cp.cuda.Stream.null.synchronize()
-    def step(self,current=18,source=0):
-        x=self.xp; t0=time.perf_counter(); active=self.ref<=0
-        inj=x.zeros(self.n,dtype=x.float32); inj[source]=current if self.n else 0
-        incoming=self.M@inj
-        self.v=x.where(active,self.v-(self.v+65)/20+incoming,self.v)
-        fg=active&(self.v>=-50)
-        fired=cp.asnumpy(cp.flatnonzero(fg)).astype(np.int32) if self.device=='CUDA' else np.flatnonzero(fg).astype(np.int32)
-        if fired.size: self.v[fg]=-70; self.ref[fg]=5
-        self.ref=x.maximum(self.ref-1,0); self.fired=fired; self.t+=1
-        if self.device=='CUDA': cp.cuda.Stream.null.synchronize()
-        self.step_ms=(time.perf_counter()-t0)*1000
-    def snapshot(self,indices):
-        if self.device=='CUDA': return cp.asnumpy(self.v[indices]),cp.asnumpy(self.ref[indices]),self.fired.copy(),self.t,self.step_ms
-        return self.v[indices].copy(),self.ref[indices].copy(),self.fired.copy(),self.t,self.step_ms
-    def info(self):
-        if self.device!='CUDA':return 'CPU'
-        try:
-            p=cp.cuda.runtime.getDeviceProperties(0); n=p['name'].decode() if isinstance(p['name'],bytes) else str(p['name']); return n
-        except:return 'CUDA GPU'
+class NeuralBeamSimulationApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Neural Beam Engine & Custom Connectivity Visualizer")
+        self.root.geometry("800x650")
+        self.root.minsize(700, 550)
 
-def demo():
-    rng=np.random.default_rng(4); n=12000; p=rng.normal(size=(n,3)).astype(np.float32); p/=np.linalg.norm(p,axis=1,keepdims=True)+1e-8; p*=180
-    s=np.arange(n,dtype=np.int32); parts=[]
-    for d in range(1,4): parts.extend([(s,(s+d)%n),( (s+d)%n,s)])
-    src=np.concatenate([a for a,b in parts]); dst=np.concatenate([b for a,b in parts]); w=rng.uniform(.1,.5,len(src)).astype(np.float32)
-    return p,(src,dst,w)
+        self.data_path = "weights.bin"
+        self.points_path = "connectivity_points.npy"
+        self.edges_path = "connectivity_edges.bin"
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__(); self.title('GPU Neural Circuit Simulation'); self.geometry('1100x760'); self.running=False; self.net=None; self.q=queue.Queue(); self.worker=None; self.load_worker=None
-        self.current=tk.DoubleVar(value=18); self.speed=tk.DoubleVar(value=1); self.render_n=600; self.indices=np.empty(0,np.int32); self.photo=None; self.last_render=0
-        top=ttk.Frame(self); top.pack(fill='x',padx=8,pady=8)
-        ttk.Button(top,text='Load connectivity',command=self.choose).pack(side='left'); self.btn=ttk.Button(top,text='Start',command=self.toggle); self.btn.pack(side='left',padx=4); ttk.Button(top,text='Reset',command=self.reset).pack(side='left'); ttk.Button(top,text='Pulse',command=self.pulse).pack(side='left',padx=4)
-        ttk.Label(top,text='Current').pack(side='left',padx=(15,3)); ttk.Scale(top,from_=1,to=50,variable=self.current,orient='horizontal',length=120).pack(side='left'); ttk.Label(top,text='Speed').pack(side='left',padx=(15,3)); ttk.Scale(top,from_=.25,to=4,variable=self.speed,orient='horizontal',length=100).pack(side='left')
-        self.info_label=ttk.Label(top,text='initializing'); self.info_label.pack(side='left',padx=15)
-        self.canvas=tk.Canvas(self,bg='#070a10',highlightthickness=0); self.canvas.pack(fill='both',expand=True); self.canvas.bind('<Configure>',self.on_canvas_resize); self.status=ttk.Label(self,text='Loading demo...',anchor='w'); self.status.pack(fill='x')
-        self.protocol('WM_DELETE_WINDOW',self.close); self.after(50,self.commands); self.after(80,self.render_loop); threading.Thread(target=self.make_demo,daemon=True).start()
-    def on_canvas_resize(self,event=None):
-        # Canvas starts at Tk's placeholder 1x1 size until the window is
-        # actually mapped. The demo network often finishes loading before
-        # that happens, so draw_static() run at load time can compute
-        # positions against a 1x1 canvas and collapse every point into a
-        # sub-pixel clump. Redraw whenever the canvas gets its real size
-        # (or is resized later) so the points always use current geometry.
-        if self.net is not None: self.draw_static()
-    def make_demo(self):
-        try:self.q.put(('net',Network(*demo(),gpu=True)))
-        except Exception as e:self.q.put(('err',str(e)))
-    def choose(self):
-        ep=filedialog.askopenfilename(title='connectivity_edges.bin',filetypes=[('Binary','*.bin')]);
-        if not ep:return
-        pp=filedialog.askopenfilename(title='connectivity_points.npy',filetypes=[('NumPy','*.npy')]);
-        if not pp:return
-        self.running=False; self.btn.config(text='Start'); self.info_label.config(text='loading...'); self.status.config(text='Reading connectivity...')
-        threading.Thread(target=self.load,args=(ep,pp),daemon=True).start()
-    def load(self,ep,pp):
-        try:
-            l=ConnectivityLoader(ep,pp); p=l.load_points(); e=l.load_edges(len(p)); self.q.put(('net',Network(p,e,True)))
-        except Exception as e:self.q.put(('err',repr(e)))
-    def commands(self):
-        try:
-            while 1:
-                typ,obj=self.q.get_nowait()
-                if typ=='net':
-                    self.running=False; self.net=obj; self.indices=np.linspace(0,self.net.n-1,min(self.render_n,self.net.n),dtype=np.int32); self.canvas.delete('all'); self.info_label.config(text=f'{obj.device}: {obj.info()}'); self.status.config(text=f'{obj.n:,} nodes / {len(obj.src):,} edges'); self.draw_static()
-                else: messagebox.showerror('Error',obj)
-        except queue.Empty:pass
-        self.after(50,self.commands)
-    def draw_static(self):
-        self.canvas.delete('all'); w=max(1,self.canvas.winfo_width()); h=max(1,self.canvas.winfo_height()); p=self.net.points[self.indices]; span=max(float(np.ptp(p[:,:2],axis=0).max()),1); sc=min(w,h)/(2.4*span); x=w/2+p[:,0]*sc; y=h/2-p[:,1]*sc
-        self.xy=np.column_stack((x,y)); self.canvas.create_text(10,10,anchor='nw',text='GPU simulation — display sample only',fill='#8aa0b5');
-        for a,b in self.xy.astype(int): self.canvas.create_oval(a-2,b-2,a+2,b+2,fill='#34485d',outline='')
-    def toggle(self):
-        if self.net is None:return
-        self.running=not self.running; self.btn.config(text='Pause' if self.running else 'Start')
-        if self.running and (self.worker is None or not self.worker.is_alive()): self.worker=threading.Thread(target=self.sim_loop,daemon=True); self.worker.start()
-    def sim_loop(self):
-        # No sleep here previously: this tight loop held the GIL almost
-        # continuously, starving the main thread's Tk after()/mainloop
-        # callbacks -- the window stopped repainting/responding even
-        # though net.step() kept advancing in the background. A short
-        # sleep each outer iteration yields the GIL regularly so the
-        # GUI keeps rendering, without meaningfully slowing simulation.
-        while self.running and self.net:
-            for _ in range(max(1,int(float(self.speed.get())*3))):
-                if not self.running:break
-                self.net.step(float(self.current.get()))
+        self.is_running = False
+        self.result_queue = queue.Queue()
+        self.latest_results = []
+
+        self._ensure_data_files()
+        self._create_widgets()
+
+    def _ensure_data_files(self):
+        """Creates default files if weights.bin doesn't exist."""
+        if not os.path.exists(self.data_path):
+            raw_weights = np.array([1.5, 2.2, 3.8, 4.1, 5.0, 6.3, 1.1], dtype=np.float32)
+            raw_weights.tofile(self.data_path)
+
+    def _create_widgets(self):
+        main_frame = ttk.Frame(self.root, padding=15)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        title_label = ttk.Label(
+            main_frame, text="Neural Beam Engine with Custom Connectivity Files", font=("Arial", 14, "bold")
+        )
+        title_label.pack(pady=(0, 10))
+
+        control_frame = ttk.LabelFrame(main_frame, text="Simulation Parameters", padding=10)
+        control_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(control_frame, text="Target Sum:").grid(row=0, column=0, sticky="w", pady=5)
+        self.target_entry = ttk.Entry(control_frame, width=12)
+        self.target_entry.insert(0, "7.0")
+        self.target_entry.grid(row=0, column=1, sticky="w", padx=10, pady=5)
+
+        ttk.Label(control_frame, text="Beam Width:").grid(row=1, column=0, sticky="w", pady=5)
+        self.beam_entry = ttk.Entry(control_frame, width=12)
+        self.beam_entry.insert(0, "4")
+        self.beam_entry.grid(row=1, column=1, sticky="w", padx=10, pady=5)
+
+        self.run_button = ttk.Button(control_frame, text="Run Simulation", command=self.start_simulation)
+        self.run_button.grid(row=0, column=2, rowspan=2, padx=15, ipadx=5, ipady=10)
+
+        self.mri_button = ttk.Button(
+            control_frame, 
+            text="Render Circuits & Labels (3D)", 
+            command=self.show_cortical_overlay,
+            state=tk.DISABLED
+        )
+        self.mri_button.grid(row=0, column=3, rowspan=2, padx=10, ipadx=5, ipady=10)
+
+        self.status_var = tk.StringVar(value="Status: Ready")
+        status_label = ttk.Label(main_frame, textvariable=self.status_var, font=("Arial", 10, "italic"))
+        status_label.pack(anchor="w", pady=(10, 5))
+
+        results_frame = ttk.LabelFrame(main_frame, text="Top Optimal Beam Paths", padding=10)
+        results_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        columns = ("rank", "cost", "sum", "path")
+        self.tree = ttk.Treeview(results_frame, columns=columns, show="headings", height=8)
+        self.tree.heading("rank", text="Rank")
+        self.tree.heading("cost", text="Cost Error")
+        self.tree.heading("sum", text="Achieved Sum")
+        self.tree.heading("path", text="Selected Path Weights")
+
+        self.tree.column("rank", width=50, anchor="center")
+        self.tree.column("cost", width=90, anchor="center")
+        self.tree.column("sum", width=100, anchor="center")
+        self.tree.column("path", width=400, anchor="w")
+
+        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _load_data(self) -> np.ndarray:
+        if not os.path.exists(self.data_path):
+            raise FileNotFoundError(f"Data file not found at {self.data_path}")
+            
+        with open(self.data_path, "rb") as f:
+            return np.fromfile(f, dtype=np.float32)
+
+    def bounded_beam_search(self, target_sum: float, beam_width: int, weights: np.ndarray):
+        beam = [(0.0, 0.0, ())]
+        
+        for w in weights:
+            if not self.is_running:
+                break
+                
+            w_float = float(w)
+            next_beam = []
+            
+            for cost, current_sum, path in beam:
+                c_float = float(cost)
+                s_float = float(current_sum)
+                
+                next_beam.append((c_float, s_float, path))
+                
+                new_sum = s_float + w_float
+                new_cost = abs(float(target_sum) - new_sum)
+                next_beam.append((new_cost, new_sum, path + (w_float,)))
+            
+            beam = heapq.nsmallest(beam_width, next_beam, key=lambda x: x[0])
             time.sleep(0.001)
-    def reset(self):
-        self.running=False; self.btn.config(text='Start')
-        if self.net:self.net.reset()
-    def pulse(self):
-        if self.net:self.net.step(float(self.current.get()))
-    def render_loop(self):
-        if self.net:self.render()
-        self.after(80,self.render_loop)
-    def render(self):
-        # Intentionally do NOT update hundreds of Tk canvas objects every frame.
-        if not hasattr(self,'xy') or self.net is None:return
-        v,r,f,t,ms=self.net.snapshot(self.indices); fired=set(f.tolist());
-        # Only redraw fired points and a tiny activity sample; this keeps Tk responsive.
-        self.canvas.delete('active');
-        for i,idx in enumerate(self.indices):
-            if int(idx) in fired:
-                x,y=self.xy[i]; self.canvas.create_oval(x-5,y-5,x+5,y+5,fill='#ff2050',outline='',tags='active')
-        self.status.config(text=f'{self.net.device} | nodes {self.net.n:,} | edges {len(self.net.src):,} | t {t:,} | firing {len(f):,} | step {ms:.3f} ms')
-    def close(self):self.running=False; self.destroy()
+            
+        return beam
 
-if __name__=='__main__':App().mainloop()
+    def _worker_loop(self, target_sum: float, beam_width: int):
+        try:
+            weights = self._load_data()
+            results = self.bounded_beam_search(target_sum, beam_width, weights)
+            self.result_queue.put(("SUCCESS", results))
+        except Exception as e:
+            self.result_queue.put(("ERROR", str(e)))
+
+    def start_simulation(self):
+        if self.is_running:
+            return
+
+        try:
+            target_sum = float(self.target_entry.get())
+            beam_width = int(self.beam_entry.get())
+            if beam_width <= 0:
+                raise ValueError("Beam width must be greater than zero.")
+        except ValueError as err:
+            messagebox.showerror("Invalid Input", f"Please enter valid numeric parameters.\nDetails: {err}")
+            return
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        self.is_running = True
+        self.run_button.config(state=tk.DISABLED)
+        self.mri_button.config(state=tk.DISABLED)
+        self.status_var.set("Status: Running subset-sum beam search...")
+
+        worker_thread = threading.Thread(target=self._worker_loop, args=(target_sum, beam_width))
+        worker_thread.daemon = True
+        worker_thread.start()
+
+        self.root.after(100, self._check_queue)
+
+    def _check_queue(self):
+        try:
+            status, data = self.result_queue.get_nowait()
+            self.is_running = False
+            self.run_button.config(state=tk.NORMAL)
+
+            if status == "SUCCESS":
+                self.latest_results = data
+                self.status_var.set("Status: Simulation complete.")
+                for idx, res in enumerate(data, start=1):
+                    cost_val = float(res[0])
+                    sum_val = float(res[1])
+                    path_val = str(res[2])
+                    self.tree.insert("", tk.END, values=(idx, f"{cost_val:.4f}", f"{sum_val:.4f}", path_val))
+                
+                if PLOTLY_AVAILABLE:
+                    self.mri_button.config(state=tk.NORMAL)
+                else:
+                    self.status_var.set("Status: Complete. Install 'plotly' to enable 3D visualizer.")
+            else:
+                self.status_var.set("Status: Simulation failed.")
+                messagebox.showerror("Execution Error", data)
+
+        except queue.Empty:
+            if self.is_running:
+                self.root.after(100, self._check_queue)
+
+    def _get_scientific_region_name(self, x: float, y: float, z: float) -> str:
+        """Maps MNI coordinate space to standard neuroanatomical scientific names."""
+        hemisphere = "Right" if x >= 0 else "Left"
+        ax, ay, az = abs(x), y, z
+
+        if ay > 30:
+            if az > 20:
+                return f"{hemisphere} Sup. Frontal"
+            elif az > 0:
+                return f"{hemisphere} Mid. Frontal"
+            else:
+                return f"{hemisphere} Orbital Frontal"
+        elif 0 <= ay <= 30:
+            if az > 35:
+                return f"{hemisphere} Precentral / Motor"
+            elif az > 10:
+                return f"{hemisphere} Supp. Motor"
+            elif az < -5:
+                return f"{hemisphere} Insular"
+            else:
+                return f"{hemisphere} Ant. Cingulate"
+        elif -50 <= ay < 0:
+            if az > 40:
+                return f"{hemisphere} Postcentral"
+            elif az > 20:
+                return f"{hemisphere} Inf. Parietal"
+            elif az < 0:
+                return f"{hemisphere} Sup. Temporal"
+            else:
+                return f"{hemisphere} Post. Cingulate"
+        else:
+            if az > 10:
+                return f"{hemisphere} Precuneus"
+            elif az < -10:
+                return f"{hemisphere} Fusiform"
+            else:
+                return f"{hemisphere} Occipital Pole"
+
+    def show_cortical_overlay(self):
+        """Renders brain mesh, circuit paths, and scientific text labels without marker balls."""
+        if not PLOTLY_AVAILABLE:
+            messagebox.showerror("Missing Dependency", "Plotly is required. Run: pip install plotly")
+            return
+
+        if not os.path.exists(self.points_path) or not os.path.exists(self.edges_path):
+            messagebox.showerror(
+                "Files Missing", 
+                f"Could not find required surface files:\n- {self.points_path}\n- {self.edges_path}"
+            )
+            return
+
+        if not self.latest_results:
+            messagebox.showinfo("Empty Results", "Please run the simulation first to generate paths.")
+            return
+
+        self.status_var.set("Status: Loading brain surface, labels, and circuit paths...")
+        self.root.update_idletasks()
+
+        try:
+            points = np.load(self.points_path).astype(np.float64)
+            raw_edges = np.fromfile(self.edges_path, dtype=np.int32)
+            
+            num_triangles = raw_edges.size // 3
+            if num_triangles == 0:
+                raise ValueError("connectivity_edges.bin contains no valid triangle data.")
+            
+            edges = raw_edges[:num_triangles * 3].reshape((-1, 3))
+            
+            if edges.min() >= 1:
+                edges -= 1
+                
+        except Exception as e:
+            messagebox.showerror("File Parsing Error", f"Failed to load binary mesh files:\n{e}")
+            return
+
+        if np.max(np.abs(points)) < 5.0:
+            points *= 1000.0
+
+        max_idx = len(points) - 1
+        valid_mask = (
+            (edges[:, 0] >= 0) & (edges[:, 0] <= max_idx) &
+            (edges[:, 1] >= 0) & (edges[:, 1] <= max_idx) &
+            (edges[:, 2] >= 0) & (edges[:, 2] <= max_idx)
+        )
+        edges = edges[valid_mask]
+
+        traces = []
+
+        # 1. Real Anatomical Brain Surface Mesh
+        brain_mesh = go.Mesh3d(
+            x=points[:, 0], y=points[:, 1], z=points[:, 2],
+            i=edges[:, 0], j=edges[:, 1], k=edges[:, 2],
+            color='rgba(135, 206, 250, 0.2)',  
+            opacity=0.25,
+            lighting=dict(ambient=0.7, diffuse=0.6, specular=0.2),
+            name='Anatomical Brain Mesh',
+            hoverinfo='skip'
+        )
+        traces.append(brain_mesh)
+
+        # 2. Add Scientific Region Labels (Sampled for clean readability without marker balls)
+        sample_step = max(1, len(points) // 60)
+        sampled_points = points[::sample_step]
+        scientific_labels = [
+            self._get_scientific_region_name(pt[0], pt[1], pt[2]) for pt in sampled_points
+        ]
+
+        labels_trace = go.Scatter3d(
+            x=sampled_points[:, 0], y=sampled_points[:, 1], z=sampled_points[:, 2],
+            mode='text',
+            text=scientific_labels,
+            textfont=dict(color='Black', size=10, family='Arial Bold'),
+            name='Scientific Region Labels'
+        )
+        traces.append(labels_trace)
+
+        def create_pipe_mesh(p1, p2, radius=4.5, n_segs=10):
+            p1, p2 = np.array(p1), np.array(p2)
+            v = p2 - p1
+            length = np.linalg.norm(v)
+            if length < 1e-6:
+                return np.empty((0, 3)), np.empty((0, 3), dtype=int)
+            v = v / length
+            
+            n1 = np.array([0, 1, 0]) if abs(v[0]) > 0.9 else np.array([1, 0, 0])
+            n1 = np.cross(v, n1)
+            n1 /= np.linalg.norm(n1)
+            n2 = np.cross(v, n1)
+            
+            theta = np.linspace(0, 2 * np.pi, n_segs, endpoint=False)
+            circle = [radius * (np.cos(th) * n1 + np.sin(th) * n2) for th in theta]
+            
+            verts = [p1 + pt for pt in circle] + [p2 + pt for pt in circle]
+            verts = np.array(verts)
+            
+            faces = []
+            for i in range(n_segs):
+                nxt = (i + 1) % n_segs
+                faces.append([i, nxt, i + n_segs])
+                faces.append([nxt, nxt + n_segs, i + n_segs])
+                
+            return verts, np.array(faces, dtype=int)
+
+        colorscales = ['Turbo', 'Viridis', 'Plasma', 'Inferno', 'Magma', 'Cividis']
+        num_points = len(points)
+
+        # 3. Render all optimal circuit paths
+        for rank_idx, res in enumerate(self.latest_results):
+            target_path = res[2]
+            if not target_path or len(target_path) < 2:
+                continue
+
+            circuit_coords = []
+            path_weights = []
+            for idx, weight in enumerate(target_path):
+                mapped_idx = (idx * 19 + rank_idx * 7) % num_points
+                circuit_coords.append(points[mapped_idx])
+                path_weights.append(float(weight))
+
+            all_verts = []
+            all_faces = []
+            all_intensities = []
+            vertex_offset = 0
+
+            for i in range(len(circuit_coords) - 1):
+                p1 = circuit_coords[i]
+                p2 = circuit_coords[i + 1]
+                seg_weight = (path_weights[i] + path_weights[i+1]) / 2.0
+                
+                v_mesh, f_mesh = create_pipe_mesh(p1, p2, radius=5.0 - (rank_idx * 0.2), n_segs=10)
+                if len(v_mesh) > 0:
+                    all_verts.append(v_mesh)
+                    all_faces.append(f_mesh + vertex_offset)
+                    all_intensities.extend([seg_weight] * len(v_mesh))
+                    vertex_offset += len(v_mesh)
+
+            if all_verts:
+                combined_verts = np.vstack(all_verts)
+                combined_faces = np.vstack(all_faces)
+                combined_intensities = np.array(all_intensities)
+
+                cscale = colorscales[rank_idx % len(colorscales)]
+                pipe_trace = go.Mesh3d(
+                    x=combined_verts[:, 0], y=combined_verts[:, 1], z=combined_verts[:, 2],
+                    i=combined_faces[:, 0], j=combined_faces[:, 1], k=combined_faces[:, 2],
+                    intensity=combined_intensities,
+                    colorscale=cscale,
+                    opacity=0.95,
+                    lighting=dict(ambient=0.5, diffuse=0.9, specular=0.6),
+                    name=f'Path Rank #{rank_idx+1}'
+                )
+                traces.append(pipe_trace)
+
+        fig = go.Figure(data=traces)
+        fig.update_layout(
+            title=dict(text="Anatomical Brain Surface with Scientific Labels & Circuits"),
+            scene=dict(
+                xaxis=dict(visible=True),
+                yaxis=dict(visible=True),
+                zaxis=dict(visible=True),
+                camera=dict(
+                    eye=dict(x=1.6, y=1.6, z=1.3)
+                )
+            )
+        )
+
+        output_file = "labeled_clean_brain.html"
+        fig.write_html(output_file, include_plotlyjs=True)
+        
+        import webbrowser
+        webbrowser.open("file://" + os.path.realpath(output_file))
+
+        self.status_var.set(f"Status: Opened labeled clean view ({output_file}).")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = NeuralBeamSimulationApp(root)
+    root.mainloop()
