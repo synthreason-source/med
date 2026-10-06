@@ -59,6 +59,15 @@ PAD, UNK, BOS, EOS = "<pad>", "<unk>", "<bos>", ""
 TOKEN_RE = re.compile(r"[a-z0-9']+|[.,!?;:]")
 SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 WORD_RE = re.compile(r"[a-z0-9']")
+
+def explain_words(values):
+    """Expand one or more command-line values into individual explainable words."""
+    words = []
+    for value in values or []:
+        words.extend(TOKEN_RE.findall(value.lower()))
+    return words
+
+
 EDGE_DTYPE = np.dtype([("src", "<u4"), ("dst", "<u4"), ("w", "<f4")])
 
 
@@ -884,18 +893,26 @@ def main():
                   f"half-life {c['half_life']} steps, mean length {c['noodle_len']:.1f}")
 
     if a.explain:
+        explain_tokens = explain_words(a.explain)
         print("[explain] per-word MRI context (node = grid coordinates after downsampling)")
-        for w in a.explain:
-            c = word_context(circ, vocab, w.lower()) if circ else None
+        for word in explain_tokens:
+            c = word_context(circ, vocab, word, top=5) if circ else None
             if c:
                 show_context(c)
             else:
-                print(f"  {w}: no circuit vector (function word, rare, or out of vocabulary)")
+                print(f"  {word:12s} no circuit vector (function word, rare, or out of vocabulary)")
 
     if a.plot_curves and circ is not None:
-        pw = [w.lower() for w in a.explain] if a.explain else \
-             [t for t in TOKEN_RE.findall((a.prompt or "").lower()) if t in vocab.stoi][:6]
-        plot_curves(a.plot_curves, circ, vocab, pw, a)
+        explain_tokens = explain_words(a.explain)
+        plot_words = (
+            explain_tokens
+            if explain_tokens
+            else [
+                t for t in TOKEN_RE.findall((a.prompt or "").lower())
+                if t in vocab.stoi
+            ][:6]
+        )
+        plot_curves(a.plot_curves, circ, vocab, plot_words, a)
 
     if a.calibrate:
         w = calibrate_beam(model, vocab, sents, circ)
