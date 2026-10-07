@@ -12,3 +12,6 @@ Gelatin is heat-sensitive and will degrade if boiled.
 3. Dissolve the Taurine
 • Taurine is water-soluble. Dissolve your target amount of taurine powder into a small, measured volume of warm distilled water or directly into the gelatin solution at 40°C.
 • Note: Keep the taurine concentration optimized (usually below 10–20% of total polymer weight), as excessive taurine can disrupt the final gel network and cause structural beads or defects.
+
+Pass your bulk hydrogel through a fine mesh or use mechanical homogenization to create a microgel paste prior to loading the syringe.
+
