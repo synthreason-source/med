@@ -33,3 +33,11 @@ Why PVA is Used as the Nanoparticle Base
 While free taurine has a short half-life and limited ability to cross the BBB efficiently on its own, formulating it into PVA nanoparticles drastically improves its clinical utility:
 • Stereostatic Stabilization: PVA acts as a highly biocompatible, non-toxic stabilizer that prevents nanoparticle aggregation in blood circulation.
 • Controlled, Sustained Release: PVA cross-linking networks eliminate the initial "burst release" common in free drugs, providing a steady, prolonged therapeutic dose directly to the damaged neural tissue.
+
+
+Why Taurine Functions Matter in Long-Term Recovery
+
+Even a decade after an injury, the biological pathways targeted by taurine-functionalized systems remain highly relevant to maintaining quality of life:
+• Suppression of Latent Inflammation: Chronic neuroinflammation can persist for decades after an ABI. Taurine significantly dampens elevated inflammatory cytokines (such as IL-6 and TNF-α), preventing long-term damage to surviving tissues.
+• Regulation of Vascular Tone: Long-term ABI survivors face elevated risks of secondary vascular events. Taurine assists in regulating blood pressure, improving endothelial health, and optimizing overall vascular function.
+• Prevention of Thromboembolic Events: It helps downregulate excessive platelet activation, reducing the long-term risk of secondary ischemic strokes.
